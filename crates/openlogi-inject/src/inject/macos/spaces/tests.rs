@@ -63,10 +63,17 @@ fn hid_swipe_reader() -> Option<CopyHidEvent> {
 /// What a Dock swipe's attached `IOHIDEvent` carries.
 #[derive(Debug)]
 struct HidSwipeReading {
+    /// The Dock motion: 1 horizontal, 2 vertical.
+    motion: isize,
     phase: u32,
     progress: f64,
     /// The X and Y of the velocity child, which only an end phase has.
     velocity: Option<(f64, f64)>,
+}
+
+/// The motion a swipe along `axis` carries in its attached event.
+fn hid_motion(axis: SwipeAxis) -> isize {
+    isize::try_from(dock_motion(axis)).expect("the motion code fits")
 }
 
 fn read_hid_swipe(copy_hid: CopyHidEvent, event: &CGEvent) -> HidSwipeReading {
@@ -86,7 +93,6 @@ fn read_hid_swipe(copy_hid: CopyHidEvent, event: &CGEvent) -> HidSwipeReading {
     let motion: isize = unsafe { msg_send![&*hid, integerValueForField: HID_FIELD_MOTION] };
     // SAFETY: HIDEvent's integer getter returns NSInteger for this field.
     let flavor: isize = unsafe { msg_send![&*hid, integerValueForField: HID_FIELD_FLAVOR] };
-    assert_eq!(motion, HID_MOTION_HORIZONTAL);
     assert_eq!(flavor, HID_FLAVOR_DOCK_PRIMARY);
     // SAFETY: HIDEvent's progress getter returns double.
     let progress: f64 = unsafe { msg_send![&*hid, doubleValueForField: HID_FIELD_PROGRESS] };
@@ -108,6 +114,7 @@ fn read_hid_swipe(copy_hid: CopyHidEvent, event: &CGEvent) -> HidSwipeReading {
             (vx, vy)
         });
     HidSwipeReading {
+        motion,
         phase: options >> 24,
         progress,
         velocity,
@@ -129,6 +136,7 @@ fn hid_dock_swipe_attaches_balanced_phases_for_both_scroll_directions() {
             let events = hid_swipe_events(direction, natural).expect("HIDEvent-backed CGEvents");
             for (event, phase) in events.iter().zip([1_u32, 4_u32]) {
                 let reading = read_hid_swipe(copy_hid, event);
+                assert_eq!(reading.motion, hid_motion(SwipeAxis::Horizontal));
                 assert_eq!(reading.phase, phase, "encoded begin/end phase");
                 assert_eq!(
                     reading.progress.to_bits(),
@@ -162,6 +170,7 @@ fn hid_slide_frames_carry_the_flipped_progress_and_an_exit_velocity_on_end() {
                 for ((at, event), frame) in events.iter().zip(&frames) {
                     assert_eq!(*at, frame.at);
                     let reading = read_hid_swipe(copy_hid, event);
+                    assert_eq!(reading.motion, hid_motion(SwipeAxis::Horizontal));
                     assert_eq!(reading.phase, slide_phase(frame.phase), "{frame:?}");
                     // The attached event may round the progress it stores.
                     let expected = flip * frame.progress;
@@ -196,7 +205,8 @@ fn slide_frames_carry_progress_phase_and_an_exit_velocity_on_end() {
             progress: -0.25,
             at: Duration::ZERO,
         };
-        let event = slide_event(frame, EMPHATIC_EXIT).expect("CGEvent allocation");
+        let event =
+            slide_event(frame, EMPHATIC_EXIT, SwipeAxis::Horizontal).expect("CGEvent allocation");
         assert_eq!(CGEvent::r#type(Some(&event)), CGEventType(30));
         for (field, expected) in [(110, 23), (123, 1), (165, 1), (132, value), (134, value)] {
             assert_eq!(
@@ -421,7 +431,8 @@ fn live_swipe_frames_use_this_macos_layout_in_dock_progress_with_the_hand_speed_
         let is_end = |phase| matches!(phase, SpaceSwipePhase::Ended { .. });
         if *DOCK_SWIPE_LAYOUT == DockSwipeLayout::Fields {
             for (phase, value) in phases {
-                let event = live_swipe_event(-0.25, phase).expect("CGEvent allocation");
+                let event = live_swipe_event(SwipeAxis::Horizontal, -0.25, phase)
+                    .expect("CGEvent allocation");
                 for field in [132, 134] {
                     assert_eq!(
                         CGEvent::integer_value_field(Some(&event), CGEventField(field)),
@@ -440,8 +451,10 @@ fn live_swipe_frames_use_this_macos_layout_in_dock_progress_with_the_hand_speed_
         // The attached event signs progress by the host's scroll preference.
         let expected = if natural_scrolling() { 0.3125 } else { -0.3125 };
         for (phase, value) in phases {
-            let event = live_swipe_event(-0.25, phase).expect("HIDEvent-backed CGEvent");
+            let event = live_swipe_event(SwipeAxis::Horizontal, -0.25, phase)
+                .expect("HIDEvent-backed CGEvent");
             let reading = read_hid_swipe(copy_hid, &event);
+            assert_eq!(reading.motion, hid_motion(SwipeAxis::Horizontal));
             assert_eq!(i64::from(reading.phase), value, "{phase:?}");
             assert!((reading.progress - expected).abs() < 1e-4, "{reading:?}");
             let exit = is_end(phase).then(|| expected.signum() * 2.5);
@@ -455,6 +468,35 @@ fn live_swipe_frames_use_this_macos_layout_in_dock_progress_with_the_hand_speed_
 }
 
 #[test]
+fn a_live_overview_frame_plays_the_vertical_swipe_one_to_one() {
+    autoreleasepool(|_| {
+        let phase = SpaceSwipePhase::Ended { speed: 2.0 };
+        let event = live_swipe_event(SwipeAxis::Vertical, 0.5, phase).expect("a CGEvent");
+        if *DOCK_SWIPE_LAYOUT == DockSwipeLayout::Fields {
+            assert_eq!(
+                CGEvent::integer_value_field(Some(&event), CGEventField(123)),
+                2
+            );
+            for field in [119, 139] {
+                assert_eq!(
+                    CGEvent::double_value_field(Some(&event), CGEventField(field)).to_bits(),
+                    f64::from(f32::from_bits(2)).to_bits()
+                );
+            }
+            let progress = CGEvent::double_value_field(Some(&event), CGEventField(124));
+            assert_eq!(progress.to_bits(), 0.5_f64.to_bits());
+            return;
+        }
+        let copy_hid = hid_swipe_reader().expect("macOS 27 has the HID swipe APIs");
+        let reading = read_hid_swipe(copy_hid, &event);
+        assert_eq!(reading.motion, hid_motion(SwipeAxis::Vertical));
+        // A trackpad's swipe up reads positive with natural scrolling on.
+        let expected = if natural_scrolling() { 0.5 } else { -0.5 };
+        assert!((reading.progress - expected).abs() < 1e-4, "{reading:?}");
+    });
+}
+
+#[test]
 fn a_live_exit_follows_the_hand_at_rest_or_capped() {
     for (speed, exit) in [
         (-3.0, 0.0),
@@ -464,7 +506,7 @@ fn a_live_exit_follows_the_hand_at_rest_or_capped() {
         (100.0, MAX_LIVE_EXIT),
     ] {
         assert_eq!(
-            live_exit(speed).to_bits(),
+            live_exit(SwipeAxis::Horizontal, speed).to_bits(),
             f64::to_bits(exit),
             "speed {speed}"
         );

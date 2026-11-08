@@ -16,7 +16,7 @@ use openlogi_hid::CapturedInput;
 use openlogi_hid::thumbwheel::WheelResolution;
 use tracing::debug;
 
-use openlogi_inject::SpaceSwipePhase;
+use openlogi_inject::{SpaceSwipePhase, SwipeAxis};
 
 use self::space_swipe::{Frame, SpaceProbe, SpaceSwipes};
 use self::wheel::{ScrollScale, WheelAccumulators, WheelOutput, WheelRotation};
@@ -106,9 +106,10 @@ impl SessionWheels {
 /// the Dock: their frames report unposted, so desktop swipes take the one-shot
 /// path they always have.
 #[cfg(not(test))]
-const POST_SPACE_SWIPE: fn(f64, SpaceSwipePhase) -> bool = openlogi_inject::post_space_swipe;
+const POST_SPACE_SWIPE: fn(SwipeAxis, f64, SpaceSwipePhase) -> bool =
+    openlogi_inject::post_space_swipe;
 #[cfg(test)]
-const POST_SPACE_SWIPE: fn(f64, SpaceSwipePhase) -> bool = |_, _| false;
+const POST_SPACE_SWIPE: fn(SwipeAxis, f64, SpaceSwipePhase) -> bool = |_, _, _| false;
 /// What live transitions read about the desktop; tests read nothing.
 #[cfg(not(test))]
 const SPACE_PROBE: SpaceProbe = SpaceProbe::NATIVE;
@@ -137,7 +138,7 @@ pub(super) struct InputDispatcher {
     wheels: SessionWheels,
     held_presses: HeldPresses,
     spaces: SpaceSwipes,
-    post_space: fn(f64, SpaceSwipePhase) -> bool,
+    post_space: fn(SwipeAxis, f64, SpaceSwipePhase) -> bool,
     shift_held: HeldShift,
 }
 
@@ -160,7 +161,7 @@ impl InputDispatcher {
     pub(super) fn with_space_output(
         mut self,
         travel: f64,
-        post: fn(f64, SpaceSwipePhase) -> bool,
+        post: fn(SwipeAxis, f64, SpaceSwipePhase) -> bool,
     ) -> Self {
         self.spaces = SpaceSwipes::new(Some(travel), SPACE_PROBE);
         self.post_space = post;
@@ -173,7 +174,7 @@ impl InputDispatcher {
     pub(super) fn with_landing_space_output(
         self,
         travel: f64,
-        post: fn(f64, SpaceSwipePhase) -> bool,
+        post: fn(SwipeAxis, f64, SpaceSwipePhase) -> bool,
     ) -> Self {
         static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut this = self.with_space_output(travel, post);
@@ -206,7 +207,7 @@ impl InputDispatcher {
             if ending {
                 debug!(key, %button, phase = ?frame.phase, progress = frame.progress, "live Space frame");
             }
-            if (self.post_space)(frame.progress, frame.phase) {
+            if (self.post_space)(frame.axis, frame.progress, frame.phase) {
                 continue;
             }
             debug!(key, %button, phase = ?frame.phase, "live Space frame not posted");
@@ -214,7 +215,8 @@ impl InputDispatcher {
             match frame.phase {
                 SpaceSwipePhase::Began => return true,
                 SpaceSwipePhase::Ended { .. } => {
-                    let _ = (self.post_space)(frame.progress, SpaceSwipePhase::Cancelled);
+                    let _ =
+                        (self.post_space)(frame.axis, frame.progress, SpaceSwipePhase::Cancelled);
                 }
                 SpaceSwipePhase::Changed | SpaceSwipePhase::Cancelled => {}
             }
@@ -323,14 +325,14 @@ impl InputDispatcher {
             CapturedInput::Gesture(button, direction) => {
                 self.dispatch_gesture(session, plan, button, direction);
             }
-            CapturedInput::GestureMotion { button, dx, .. } => {
-                self.follow_gesture_motion(session, button, dx);
+            CapturedInput::GestureMotion { button, dx, dy } => {
+                self.follow_gesture_motion(session, button, dx, dy);
             }
-            CapturedInput::GestureCommitTravel { button, dx, .. } => {
+            CapturedInput::GestureCommitTravel { button, dx, dy } => {
                 // Only a transition this commit just opened takes the commit's
                 // travel; one already following the hold saw it as motion.
                 if self.spaces.awaits_commit_travel(session, button) {
-                    self.follow_gesture_motion(session, button, dx);
+                    self.follow_gesture_motion(session, button, dx, dy);
                 }
             }
             CapturedInput::ButtonDown(button) => {
@@ -369,6 +371,11 @@ impl InputDispatcher {
                 // finish a switch on release, even with no motion since the
                 // reload to cancel it: spring its transition back instead.
                 let frames = if self.press_is_live(session, button) {
+                    // A hold released before the last switch landed never
+                    // began its transition: it switches one-shot instead.
+                    if let Some(action) = self.spaces.unstarted(session, button) {
+                        self.dispatch_while_held(session, button, &action);
+                    }
                     self.spaces.end(session, button, Instant::now())
                 } else {
                     self.spaces.cancel(session, button)
@@ -489,34 +496,53 @@ impl InputDispatcher {
         };
         debug!(key, %button, ?direction, action = %action.label(), "gesture → action");
         let opposite = map.and_then(|map| map.get(&reverse(direction)));
-        if let Some(frame) =
+        if let Some(opened) =
             self.spaces
                 .begin(session, button, direction, action, opposite, Instant::now())
         {
-            if (self.post_space)(frame.progress, frame.phase) {
+            let Some(frame) = opened.frame() else {
+                debug!(key, %button, ?direction, "live Space transition waits for the last switch to land");
+                return;
+            };
+            if (self.post_space)(frame.axis, frame.progress, frame.phase) {
                 debug!(key, %button, ?direction, "live Space transition began");
                 return;
             }
             // No live transition here: the one-shot switch instead.
             self.spaces.abandon(session, button);
         }
-        let Some(press) = self.held_presses.get(session, button) else {
-            return;
-        };
-        if !self
-            .outputs
-            .actions
-            .try_dispatch_while_pressed(press, action)
-        {
+        if !self.dispatch_while_held(session, button, action) {
             debug!(key, %button, ?direction, "gesture press no longer active — ignored");
         }
     }
 
+    /// Run `action` one-shot for `button`'s held press, saying whether the
+    /// press was still active to run it.
+    fn dispatch_while_held(
+        &self,
+        session: &HidppSessionId,
+        button: ButtonId,
+        action: &Action,
+    ) -> bool {
+        self.held_presses.get(session, button).is_some_and(|press| {
+            self.outputs
+                .actions
+                .try_dispatch_while_pressed(press, action)
+        })
+    }
+
     /// Move the live transition `button`'s hold is driving, or spring it back
     /// at once when the press ended without a release reaching this session.
-    fn follow_gesture_motion(&mut self, session: &HidppSessionId, button: ButtonId, dx: i32) {
+    fn follow_gesture_motion(
+        &mut self,
+        session: &HidppSessionId,
+        button: ButtonId,
+        dx: i32,
+        dy: i32,
+    ) {
+        let unstarted = self.spaces.unstarted(session, button);
         let frames = if self.press_is_live(session, button) {
-            self.spaces.motion(session, button, dx, Instant::now())
+            self.spaces.motion(session, button, dx, dy, Instant::now())
         } else {
             self.spaces.cancel(session, button)
         };
@@ -527,6 +553,11 @@ impl InputDispatcher {
             // commits start over as actions.
             debug!(key = session.device_key(), %button, "live Space leg refused — transition dropped");
             self.spaces.abandon(session, button);
+            // A hold whose first Began waited on a landing and was refused
+            // switches one-shot instead, as one refused at once would.
+            if let Some(action) = unstarted {
+                self.dispatch_while_held(session, button, &action);
+            }
         }
     }
 

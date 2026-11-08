@@ -865,10 +865,23 @@ pub enum SpaceSwipePhase {
     Cancelled,
 }
 
+/// The trackpad swipe a live transition plays: which Dock gesture follows
+/// the hand, whichever way the hand itself moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwipeAxis {
+    /// A three-finger swipe sideways: the Dock drags the neighbouring
+    /// desktop in. Progress is in desktop widths, positive toward the next.
+    Horizontal,
+    /// A three-finger swipe up or down: the Dock opens Mission Control
+    /// (positive progress) or App Exposé (negative) as the hand moves.
+    /// Progress is the fraction of the way open.
+    Vertical,
+}
+
 /// Post one frame of a live, follow-the-hand Space transition.
 ///
-/// `progress` is the cumulative travel since the transition began, in desktop
-/// widths, positive toward the next desktop. macOS posts it in whichever Dock
+/// `progress` is the cumulative travel since the transition began, signed
+/// and scaled as `axis` describes. macOS posts it in whichever Dock
 /// swipe layout the running release reads. Returns `false` when nothing was
 /// posted (no such transition on this platform, or a non-finite progress or
 /// speed), so the caller can fall back to the one-shot desktop action.
@@ -879,7 +892,7 @@ pub enum SpaceSwipePhase {
 /// so is every other phase while none runs. A refused `Ended` leaves the
 /// transition open for the caller's `Cancelled`.
 #[must_use]
-pub fn post_space_swipe(progress: f64, phase: SpaceSwipePhase) -> bool {
+pub fn post_space_swipe(axis: SwipeAxis, progress: f64, phase: SpaceSwipePhase) -> bool {
     let speed_is_finite = match phase {
         SpaceSwipePhase::Ended { speed } => speed.is_finite(),
         SpaceSwipePhase::Began | SpaceSwipePhase::Changed | SpaceSwipePhase::Cancelled => true,
@@ -889,10 +902,10 @@ pub fn post_space_swipe(progress: f64, phase: SpaceSwipePhase) -> bool {
     }
     cfg_select! {
         target_os = "macos" => {
-            macos::post_space_swipe(progress, phase)
+            macos::post_space_swipe(axis, progress, phase)
         }
         _ => {
-            let _ = phase;
+            let _ = (axis, phase);
             false
         }
     }
