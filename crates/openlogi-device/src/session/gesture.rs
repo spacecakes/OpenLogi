@@ -213,6 +213,10 @@ pub struct CaptureSpec {
     /// Standard-button CIDs requested as raw-XY gesture sources. A control is
     /// armed only when its HID++ capability flags advertise raw-XY support.
     pub divert_gesture_buttons: Vec<(u16, ButtonId)>,
+    /// The gesture directions whose swipe the agent plays live: a hold heading
+    /// one of these commits as soon as it moves, with no hold gate, and a
+    /// release before it travels a full swipe still reads as a click.
+    pub eager_gestures: Vec<(ButtonId, GestureDirection)>,
     /// Buttons to divert as plain presses (no raw-XY): the
     /// [`DIVERTABLE_STANDARD_BUTTONS`] and non-gesturing
     /// [`GESTURE_SOURCE_BUTTONS`] whose binding leaves the default.
@@ -287,9 +291,10 @@ struct GestureCapture {
 
 impl GestureCapture {
     fn new(armed: ArmedControls) -> Self {
+        let accum = CaptureAccum::with_eager(armed.eager_gestures.clone());
         Self {
             armed,
-            accum: Arc::default(),
+            accum: Arc::new(Mutex::new(accum)),
             thumb_status: Arc::new(Mutex::new(RotationStatus::Inactive)),
             spy_edges: Arc::default(),
         }
@@ -432,7 +437,8 @@ impl ArmedCapture for GestureCapture {
     }
 
     fn reset_input_state(&self) {
-        *self.accum.lock().unwrap_or_else(PoisonError::into_inner) = CaptureAccum::default();
+        *self.accum.lock().unwrap_or_else(PoisonError::into_inner) =
+            CaptureAccum::with_eager(self.armed.eager_gestures.clone());
         // A power cycle ends any roll in progress; carrying it over would
         // swallow the first tap after the reconnect.
         *self

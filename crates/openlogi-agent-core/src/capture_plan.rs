@@ -26,6 +26,7 @@ use openlogi_hid::session::gesture::{
 use tokio::sync::watch;
 
 use crate::runtime::PointerSelection;
+use crate::watchers::gesture::plays_live;
 
 /// Hardware identity of one HID++ capture session.
 ///
@@ -307,6 +308,24 @@ pub struct PlanDevice<'a> {
     pub layout: Option<&'a GamingLayout>,
 }
 
+/// Every HID++ gesture direction bound to an action that plays live.
+fn live_gestures(
+    gesture_bindings: &BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
+    side_gesture_bindings: &BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
+) -> Vec<(ButtonId, GestureDirection)> {
+    gesture_bindings
+        .iter()
+        .chain(side_gesture_bindings)
+        .flat_map(|(&button, map)| {
+            map.iter()
+                .filter(|&(&direction, action)| {
+                    direction != GestureDirection::Click && plays_live(action)
+                })
+                .map(move |(&direction, _)| (button, direction))
+        })
+        .collect()
+}
+
 /// Build one device's plan from the config (per-app effective for `app`).
 #[must_use]
 pub fn plan_for_device(
@@ -422,6 +441,7 @@ pub fn plan_for_device(
                     .map(|(cid, _)| cid)
                     .collect(),
                 divert_gesture_buttons,
+                eager_gestures: live_gestures(&gesture_bindings, &side_gesture_bindings),
                 divert_buttons,
                 divert_wheel_buttons,
                 // Needs the device's wheel capabilities and the settings of
@@ -705,6 +725,31 @@ mod tests {
                 .any(|&(cid, _)| cid == GESTURE_BUTTON_CID || cid == HAPTIC_PANEL_CID),
             "a raw-XY-diverted source must never also be plain-diverted"
         );
+    }
+
+    #[test]
+    fn only_live_gesture_directions_start_eagerly() {
+        let mut cfg = Config::default();
+        cfg.set_gesture_mode("2b042", ButtonId::GestureButton, true);
+        cfg.set_gesture_direction(
+            "2b042",
+            ButtonId::GestureButton,
+            GestureDirection::Left,
+            Action::NextDesktop,
+        );
+        cfg.set_gesture_direction(
+            "2b042",
+            ButtonId::GestureButton,
+            GestureDirection::Down,
+            Action::Copy,
+        );
+
+        let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
+        let eager = &plan.target.spec.eager_gestures;
+        let left = (ButtonId::GestureButton, GestureDirection::Left);
+        assert_eq!(eager.contains(&left), cfg!(target_os = "macos"));
+        assert!(!eager.contains(&(ButtonId::GestureButton, GestureDirection::Down)));
+        assert!(eager.iter().all(|&(_, d)| d != GestureDirection::Click));
     }
 
     #[test]

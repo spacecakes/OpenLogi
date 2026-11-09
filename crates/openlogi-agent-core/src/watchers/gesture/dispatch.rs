@@ -18,6 +18,7 @@ use tracing::debug;
 
 use openlogi_inject::{SpaceSwipePhase, SwipeAxis};
 
+pub(crate) use self::space_swipe::plays_live;
 use self::space_swipe::{Frame, SpaceProbe, SpaceSwipes};
 use self::wheel::{ScrollScale, WheelAccumulators, WheelOutput, WheelRotation};
 use super::GestureOutputs;

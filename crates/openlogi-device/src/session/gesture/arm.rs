@@ -11,7 +11,7 @@ use hidpp::feature::{
 };
 use hidpp::protocol::v20::Hidpp20Error;
 use hidpp::{channel::HidppChannel, device::Device};
-use openlogi_core::binding::ButtonId;
+use openlogi_core::binding::{ButtonId, GestureDirection};
 use tracing::{debug, info, warn};
 
 use super::CaptureSpec;
@@ -44,6 +44,8 @@ pub(super) struct ArmedControls {
     /// Raw-XY-capable additional CIDs diverted as gesture sources (side
     /// buttons on supported desktops and a gesture-mode DPI/ModeShift button).
     pub(super) gesture_button_cids: Vec<(u16, ButtonId)>,
+    /// The spec's [`CaptureSpec::eager_gestures`], for the accumulator.
+    pub(super) eager_gestures: Vec<(ButtonId, GestureDirection)>,
     /// DPI/ModeShift CIDs diverted as plain buttons when gesture mode is off.
     pub(super) dpi_cids: Vec<u16>,
     /// Standard-button CIDs diverted per the session's [`CaptureSpec`], with
@@ -284,6 +286,7 @@ pub(super) async fn arm_controls_into(
     spec: &CaptureSpec,
     armed: &mut ArmedControls,
 ) -> Result<(), CaptureError> {
+    armed.eager_gestures.clone_from(&spec.eager_gestures);
     if let Some(info) = device
         .root()
         .get_feature(reprog_controls::FEATURE_ID)

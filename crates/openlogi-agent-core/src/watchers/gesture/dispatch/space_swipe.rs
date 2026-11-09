@@ -136,6 +136,11 @@ fn live_target(action: &Action) -> Option<(SwipeAxis, f64)> {
     }
 }
 
+/// Whether `action` plays as a live swipe on this platform.
+pub(crate) fn plays_live(action: &Action) -> bool {
+    cfg!(target_os = "macos") && live_target(action).is_some()
+}
+
 /// The raw-XY axis a swipe travels along and its sign there: `+1`
 /// rightward or downward.
 fn swipe_source(direction: GestureDirection) -> Option<(SwipeAxis, f64)> {

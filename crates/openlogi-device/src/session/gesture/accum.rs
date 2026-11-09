@@ -43,10 +43,22 @@ enum HoldState {
     },
 }
 
-/// Begin a hold for `cid`, its swipe accumulator started fresh.
-fn begin_hold(cid: u16, button: ButtonId, overlap: bool, skip_first_raw_xy: bool) -> HoldState {
+/// Begin a hold for `cid`, its swipe accumulator started fresh and eager in
+/// `button`'s directions among `eager`.
+fn begin_hold(
+    cid: u16,
+    button: ButtonId,
+    overlap: bool,
+    skip_first_raw_xy: bool,
+    eager: &[(ButtonId, GestureDirection)],
+) -> HoldState {
     let mut swipe = SwipeAccumulator::default();
-    swipe.begin();
+    swipe.begin_eager(
+        eager
+            .iter()
+            .filter(|&&(eager_button, _)| eager_button == button)
+            .map(|&(_, direction)| direction),
+    );
     HoldState::Holding {
         cid,
         button,
@@ -72,6 +84,19 @@ pub(super) struct CaptureAccum {
     /// Diverted standard-button and wheel-hold CIDs held in the last event,
     /// in press order.
     buttons_down: Vec<u16>,
+    /// The directions each button's hold commits eagerly (see
+    /// [`super::CaptureSpec::eager_gestures`]).
+    eager: Vec<(ButtonId, GestureDirection)>,
+}
+
+impl CaptureAccum {
+    /// An idle accumulator whose holds commit `eager` directions eagerly.
+    pub(super) fn with_eager(eager: Vec<(ButtonId, GestureDirection)>) -> Self {
+        Self {
+            eager,
+            ..Self::default()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +202,7 @@ impl CaptureAccum {
                                 button,
                                 held.len() > 1,
                                 !self.gestures_down.contains(&cid),
+                                &self.eager,
                             ),
                             None => HoldState::Idle,
                         }
