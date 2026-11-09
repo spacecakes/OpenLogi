@@ -742,7 +742,7 @@ fn active_session_adopts_gesture_and_per_app_dispatch_changes() {
         "mouse-a",
         ButtonId::GestureButton,
         GestureDirection::Right,
-        Action::MissionControl,
+        Action::Copy,
     );
     let gestured = crate::capture_plan::plan_for_device(
         &config,
@@ -770,7 +770,7 @@ fn active_session_adopts_gesture_and_per_app_dispatch_changes() {
             .gesture_bindings
             .get(&ButtonId::GestureButton)
             .and_then(|map| map.get(&GestureDirection::Right)),
-        Some(&Action::MissionControl)
+        Some(&Action::Copy)
     );
 
     config.set_binding(

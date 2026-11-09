@@ -22,6 +22,8 @@
 
 mod dispatch;
 
+pub(crate) use dispatch::plays_live;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -33,6 +33,11 @@ pub const GESTURE_REARM_PAUSE: std::time::Duration = std::time::Duration::from_m
 /// cursor happened to be moving. Shared by both gesture paths (the HID++ thumb
 /// pad and the OS-hook Back/Forward buttons).
 pub const GESTURE_HOLD_FOR_SWIPE: std::time::Duration = std::time::Duration::from_millis(160);
+/// Dominant-axis travel at which a hold commits at once to an eager direction
+/// (one that plays live, see [`SwipeAccumulator::begin_eager`]), with no hold
+/// gate or straightness rule, so the animation starts with the hand. Like any
+/// commit, it makes the release a swipe end rather than a click.
+pub const GESTURE_EAGER_THRESHOLD: i32 = 12;
 
 /// Classify the *running* raw-XY travel of a held gesture button into a
 /// directional swipe, the instant it commits — or `None` while it's still too
@@ -120,11 +125,23 @@ pub struct SwipeAccumulator {
     moved_at: Option<Instant>,
     /// The travel behind the latest fresh commit, until it is taken.
     committed: Option<(i32, i32)>,
+    /// The directions this hold commits eagerly, as [`direction_bit`]s.
+    eager: u8,
 }
 
 impl SwipeAccumulator {
     /// Begin a fresh hold, resetting the travel accumulator and commit state.
     pub fn begin(&mut self) {
+        self.begin_eager([]);
+    }
+
+    /// Begin a fresh hold that commits any of `eager` as soon as the hand
+    /// heads that way ([`GESTURE_EAGER_THRESHOLD`]). Meant for directions a
+    /// consumer plays live, so the animation follows the hand from the start.
+    pub fn begin_eager(&mut self, eager: impl IntoIterator<Item = GestureDirection>) {
+        self.eager = eager
+            .into_iter()
+            .fold(0, |bits, dir| bits | direction_bit(dir));
         self.held_since = Some(Instant::now());
         self.dx = 0;
         self.dy = 0;
@@ -235,7 +252,13 @@ impl SwipeAccumulator {
         let held_long_enough = self
             .held_since
             .is_some_and(|t| t.elapsed() >= GESTURE_HOLD_FOR_SWIPE);
-        if held_long_enough && let Some(dir) = detect_swipe(self.dx, self.dy) {
+        let swiped = held_long_enough
+            .then(|| detect_swipe(self.dx, self.dy))
+            .flatten();
+        let eager = (!self.fired && swiped.is_none())
+            .then(|| self.eager_direction())
+            .flatten();
+        if let Some(dir) = swiped.or(eager) {
             self.fired = true;
             self.last = Some(dir);
             self.committed = Some((self.dx, self.dy));
@@ -246,6 +269,22 @@ impl SwipeAccumulator {
             return Some(dir);
         }
         None
+    }
+
+    /// The eager direction the travel so far heads, once it reaches
+    /// [`GESTURE_EAGER_THRESHOLD`] along its dominant axis.
+    fn eager_direction(&self) -> Option<GestureDirection> {
+        let (abs_x, abs_y) = (self.dx.saturating_abs(), self.dy.saturating_abs());
+        if abs_x.max(abs_y) < GESTURE_EAGER_THRESHOLD {
+            return None;
+        }
+        let dir = match (abs_x >= abs_y, self.dx > 0, self.dy > 0) {
+            (true, true, _) => GestureDirection::Right,
+            (true, false, _) => GestureDirection::Left,
+            (false, _, true) => GestureDirection::Down,
+            (false, _, false) => GestureDirection::Up,
+        };
+        (self.eager & direction_bit(dir) != 0).then_some(dir)
     }
 
     /// The travel behind the commit [`Self::accumulate`] just returned, once,
@@ -264,8 +303,8 @@ impl SwipeAccumulator {
 
     /// End the current hold. Returns `true` when an in-progress hold ended
     /// without committing a swipe — the caller should fire the plain `Click`
-    /// action — and `false` when a swipe already fired mid-motion, or when there
-    /// was no hold to end (a stray release reports no click).
+    /// action — and `false` when a swipe already fired mid-motion, or when there was no
+    /// hold to end (a stray release reports no click).
     pub fn end(&mut self) -> bool {
         let was_click = self.held_since.is_some() && !self.fired;
         self.held_since = None;
@@ -290,6 +329,17 @@ impl SwipeAccumulator {
         if let Some(moved_at) = self.moved_at {
             self.moved_at = moved_at.checked_sub(GESTURE_REARM_PAUSE * 2);
         }
+    }
+}
+
+/// `direction`'s bit in [`SwipeAccumulator`]'s eager set.
+fn direction_bit(direction: GestureDirection) -> u8 {
+    match direction {
+        GestureDirection::Left => 1,
+        GestureDirection::Right => 2,
+        GestureDirection::Up => 4,
+        GestureDirection::Down => 8,
+        GestureDirection::Click => 0,
     }
 }
 
@@ -398,6 +448,32 @@ mod tests {
     }
 
     // ── SwipeAccumulator (the shared mid-swipe state machine) ─────────────────
+
+    #[test]
+    fn eager_direction_commits_without_the_hold_gate() {
+        let mut acc = SwipeAccumulator::default();
+        acc.begin_eager([GestureDirection::Right]);
+        assert_eq!(acc.accumulate(GESTURE_EAGER_THRESHOLD - 1, 0), None);
+        assert_eq!(acc.accumulate(1, 3), Some(GestureDirection::Right));
+    }
+
+    #[test]
+    fn non_eager_direction_still_waits_for_the_hold_gate() {
+        let mut acc = SwipeAccumulator::default();
+        acc.begin_eager([GestureDirection::Right]);
+        assert_eq!(acc.accumulate(-(GESTURE_SWIPE_THRESHOLD + 10), 0), None);
+    }
+
+    #[test]
+    fn releasing_an_eager_commit_is_not_a_click() {
+        let mut acc = SwipeAccumulator::default();
+        acc.begin_eager([GestureDirection::Right]);
+        assert_eq!(
+            acc.accumulate(GESTURE_EAGER_THRESHOLD, 0),
+            Some(GestureDirection::Right)
+        );
+        assert!(!acc.end());
+    }
 
     #[test]
     fn accumulator_commits_a_direction_once_after_the_hold_gate() {
