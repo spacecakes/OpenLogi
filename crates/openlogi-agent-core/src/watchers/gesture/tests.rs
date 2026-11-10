@@ -1039,12 +1039,12 @@ async fn a_desktop_swipe_drives_one_live_transition_until_release() {
     use std::cell::RefCell;
 
     use crate::runtime::scroll::{ScrollPreferences, ScrollRuntime};
-    use openlogi_inject::SpaceSwipePhase;
+    use openlogi_inject::{SpaceSwipePhase, SwipeAxis};
 
     thread_local! {
         static POSTED: RefCell<Vec<SpaceSwipePhase>> = const { RefCell::new(Vec::new()) };
     }
-    fn record(_progress: f64, phase: SpaceSwipePhase) -> bool {
+    fn record(_axis: SwipeAxis, _progress: f64, phase: SpaceSwipePhase) -> bool {
         POSTED.with_borrow_mut(|posted| posted.push(phase));
         true
     }
@@ -1121,12 +1121,12 @@ async fn an_invalidated_press_springs_its_live_transition_back_on_release() {
     use std::cell::RefCell;
 
     use crate::runtime::scroll::{ScrollPreferences, ScrollRuntime};
-    use openlogi_inject::SpaceSwipePhase;
+    use openlogi_inject::{SpaceSwipePhase, SwipeAxis};
 
     thread_local! {
         static POSTED: RefCell<Vec<SpaceSwipePhase>> = const { RefCell::new(Vec::new()) };
     }
-    fn record(_progress: f64, phase: SpaceSwipePhase) -> bool {
+    fn record(_axis: SwipeAxis, _progress: f64, phase: SpaceSwipePhase) -> bool {
         POSTED.with_borrow_mut(|posted| posted.push(phase));
         true
     }
@@ -1214,12 +1214,12 @@ async fn only_a_transition_its_commit_opens_takes_the_commit_travel() {
     use std::cell::RefCell;
 
     use crate::runtime::scroll::{ScrollPreferences, ScrollRuntime};
-    use openlogi_inject::SpaceSwipePhase;
+    use openlogi_inject::{SpaceSwipePhase, SwipeAxis};
 
     thread_local! {
         static POSTED: RefCell<Vec<(SpaceSwipePhase, f64)>> = const { RefCell::new(Vec::new()) };
     }
-    fn record(progress: f64, phase: SpaceSwipePhase) -> bool {
+    fn record(_axis: SwipeAxis, progress: f64, phase: SpaceSwipePhase) -> bool {
         POSTED.with_borrow_mut(|posted| posted.push((phase, progress)));
         true
     }
@@ -1333,7 +1333,7 @@ async fn a_refused_next_leg_drops_the_holds_live_transition() {
     use std::cell::{Cell, RefCell};
 
     use crate::runtime::scroll::{ScrollPreferences, ScrollRuntime};
-    use openlogi_inject::SpaceSwipePhase;
+    use openlogi_inject::{SpaceSwipePhase, SwipeAxis};
 
     thread_local! {
         static POSTED: RefCell<Vec<SpaceSwipePhase>> = const { RefCell::new(Vec::new()) };
@@ -1341,7 +1341,7 @@ async fn a_refused_next_leg_drops_the_holds_live_transition() {
     }
     /// Accepts the hold's first Began and refuses the next, as when a one-shot
     /// switch takes the Dock between two legs.
-    fn refuse_second_began(_progress: f64, phase: SpaceSwipePhase) -> bool {
+    fn refuse_second_began(_axis: SwipeAxis, _progress: f64, phase: SpaceSwipePhase) -> bool {
         POSTED.with_borrow_mut(|posted| posted.push(phase));
         if phase != SpaceSwipePhase::Began {
             return true;
@@ -1424,12 +1424,12 @@ async fn queued_motion_preserves_release_speed() {
     use std::cell::RefCell;
 
     use crate::runtime::scroll::{ScrollPreferences, ScrollRuntime};
-    use openlogi_inject::SpaceSwipePhase;
+    use openlogi_inject::{SpaceSwipePhase, SwipeAxis};
 
     thread_local! {
         static POSTED: RefCell<Vec<SpaceSwipePhase>> = const { RefCell::new(Vec::new()) };
     }
-    fn record(_progress: f64, phase: SpaceSwipePhase) -> bool {
+    fn record(_axis: SwipeAxis, _progress: f64, phase: SpaceSwipePhase) -> bool {
         POSTED.with_borrow_mut(|posted| posted.push(phase));
         true
     }
@@ -1535,12 +1535,12 @@ async fn queued_motion_waits_for_actual_landing() {
     use std::cell::RefCell;
 
     use crate::runtime::scroll::{ScrollPreferences, ScrollRuntime};
-    use openlogi_inject::SpaceSwipePhase;
+    use openlogi_inject::{SpaceSwipePhase, SwipeAxis};
 
     thread_local! {
         static POSTED: RefCell<Vec<SpaceSwipePhase>> = const { RefCell::new(Vec::new()) };
     }
-    fn record(_progress: f64, phase: SpaceSwipePhase) -> bool {
+    fn record(_axis: SwipeAxis, _progress: f64, phase: SpaceSwipePhase) -> bool {
         POSTED.with_borrow_mut(|posted| posted.push(phase));
         true
     }

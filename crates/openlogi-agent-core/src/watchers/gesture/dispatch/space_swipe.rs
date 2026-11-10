@@ -14,6 +14,15 @@
 //! to where the hand has got to. At the first and last desktop the transition
 //! holds at the edge instead of asking for a switch the Dock cannot make.
 //!
+//! Mission Control and App Exposé play the same way along the trackpad's
+//! vertical swipe: the overview opens as the hand moves and the release
+//! finishes opening it or lets it fall closed. They never finish mid-hold:
+//! the transition holds fully open until the release.
+//!
+//! Whichever way the hand moves is the bound direction's business: the
+//! action picks the Dock gesture, and travel along the bound swipe's own axis
+//! drives it, so Mission Control bound to Left still follows the hand.
+//!
 //! This is pure policy: it turns hold events into frames, and the dispatcher
 //! posts them.
 
@@ -21,7 +30,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use openlogi_core::binding::{Action, ButtonId, GestureDirection};
-use openlogi_inject::{SpacePosition, SpaceSwipePhase};
+use openlogi_inject::{SpacePosition, SpaceSwipePhase, SwipeAxis};
 
 use crate::runtime::HidppSessionId;
 
@@ -86,35 +95,67 @@ pub(super) struct Timing {
     pub(super) now: Instant,
 }
 
-/// One frame for the Dock: cumulative progress in desktop widths (positive
-/// toward the next desktop) and its lifecycle phase.
+/// One frame for the Dock: the gesture it plays, cumulative progress
+/// (desktop widths positive toward the next desktop, or the fraction open
+/// positive toward Mission Control) and its lifecycle phase.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Frame {
+    pub(super) axis: SwipeAxis,
     pub(super) progress: f64,
     pub(super) phase: SpaceSwipePhase,
 }
 
 impl Frame {
-    const fn new(progress: f64, phase: SpaceSwipePhase) -> Self {
-        Self { progress, phase }
+    const fn new(axis: SwipeAxis, progress: f64, phase: SpaceSwipePhase) -> Self {
+        Self {
+            axis,
+            progress,
+            phase,
+        }
     }
 }
 
-/// The progress sign of a desktop action: `+1` toward the next desktop.
-fn desktop_sign(action: &Action) -> Option<f64> {
+/// How far a vertical swipe's `Began` already reaches toward `target`. The
+/// Dock picks Mission Control or App Exposé from that first frame and drops
+/// a vertical swipe that begins at rest; a trackpad's begins about 0.01 along.
+const VERTICAL_BEGAN_PROGRESS: f64 = 0.01;
+
+/// The progress a live swipe's `Began` frame carries along `axis`.
+fn began_progress(axis: SwipeAxis, target: f64) -> f64 {
+    match axis {
+        SwipeAxis::Horizontal => 0.0,
+        SwipeAxis::Vertical => target * VERTICAL_BEGAN_PROGRESS,
+    }
+}
+
+/// Whether a transition along `axis` moves the Space: a desktop switch does,
+/// while an overview only opens over it and never ticks the Space probe.
+fn switches_desktop(axis: SwipeAxis) -> bool {
+    axis == SwipeAxis::Horizontal
+}
+
+/// The Dock gesture an action plays live, and its progress sign: `+1` toward
+/// the next desktop, or toward Mission Control. Show Desktop is a pinch, not
+/// a swipe, and stays one-shot with every other action.
+fn live_target(action: &Action) -> Option<(SwipeAxis, f64)> {
     match action {
-        Action::NextDesktop => Some(1.0),
-        Action::PreviousDesktop => Some(-1.0),
+        Action::NextDesktop => Some((SwipeAxis::Horizontal, 1.0)),
+        Action::PreviousDesktop => Some((SwipeAxis::Horizontal, -1.0)),
+        Action::MissionControl => Some((SwipeAxis::Vertical, 1.0)),
+        Action::AppExpose => Some((SwipeAxis::Vertical, -1.0)),
         _ => None,
     }
 }
 
-/// The raw-XY sign of a horizontal swipe: `+1` rightward.
-fn horizontal_sign(direction: GestureDirection) -> Option<f64> {
+/// The raw-XY axis a swipe travels along and its sign there: `+1`
+/// rightward or downward.
+fn swipe_source(direction: GestureDirection) -> Option<(SwipeAxis, f64)> {
     match direction {
-        GestureDirection::Right => Some(1.0),
-        GestureDirection::Left => Some(-1.0),
-        GestureDirection::Up | GestureDirection::Down | GestureDirection::Click => None,
+        GestureDirection::Right => Some((SwipeAxis::Horizontal, 1.0)),
+        GestureDirection::Left => Some((SwipeAxis::Horizontal, -1.0)),
+        GestureDirection::Down => Some((SwipeAxis::Vertical, 1.0)),
+        GestureDirection::Up => Some((SwipeAxis::Vertical, -1.0)),
+        GestureDirection::Click => None,
     }
 }
 
@@ -126,6 +167,12 @@ struct Bounds {
 }
 
 impl Bounds {
+    /// No edge: an overview opens either way from anywhere.
+    const OPEN: Self = Self {
+        previous: true,
+        next: true,
+    };
+
     fn read(probe: SpaceProbe) -> Self {
         (probe.position)().map_or(
             Self {
@@ -233,8 +280,13 @@ impl Stage {
 }
 
 struct Transition {
-    /// Progress per unit of rightward raw travel's sign: `+1` when moving
-    /// right heads toward the next desktop.
+    /// The Dock gesture the transition plays.
+    axis: SwipeAxis,
+    /// The raw-XY axis the hand drives it along: the bound swipe's own.
+    along: SwipeAxis,
+    /// Progress per unit of raw travel along `along` (rightward or
+    /// downward): `+1` when that heads toward the next desktop or Mission
+    /// Control.
     polarity: f64,
     /// The progress sign the hand may not drag back across, when the opposite
     /// swipe is not bound to the opposite desktop action; `None` lets the
@@ -252,8 +304,10 @@ struct Transition {
 /// Move a leg to `progress`: follow the hand below a full desktop, hold at the
 /// edge of the last desktop, or finish the switch at a full width and settle.
 /// `velocity` is the hand's speed along the transition, which a finish
-/// carries toward its desktop; `now` is when the frame goes out.
+/// carries toward its desktop; `now` is when the frame goes out. An overview
+/// never finishes mid-hold: it holds fully open until the release.
 fn step(
+    axis: SwipeAxis,
     progress: f64,
     velocity: f64,
     bounds: Bounds,
@@ -263,13 +317,16 @@ fn step(
     let follow = |progress: f64, bounds: Bounds| {
         (
             Stage::InFlight { progress, bounds },
-            Frame::new(progress, SpaceSwipePhase::Changed),
+            Frame::new(axis, progress, SpaceSwipePhase::Changed),
         )
     };
     if progress.abs() < 1.0 {
         return follow(progress, bounds);
     }
     let sign = progress.signum();
+    if !switches_desktop(axis) {
+        return follow(sign, bounds);
+    }
     // The edge read at the start can predate a switch WindowServer has not
     // reported yet: read it again before holding there.
     let bounds = if bounds.allows(sign) {
@@ -282,7 +339,10 @@ fn step(
     }
     let waiting = Stage::WaitingNext(Landing::at(probe, now));
     let speed = velocity * sign;
-    (waiting, Frame::new(sign, SpaceSwipePhase::Ended { speed }))
+    (
+        waiting,
+        Frame::new(axis, sign, SpaceSwipePhase::Ended { speed }),
+    )
 }
 
 /// Live transitions by capture session and held gesture source. A hold keeps
@@ -321,10 +381,11 @@ impl SpaceSwipes {
             .is_some_and(|t| t.fresh)
     }
 
-    /// Open a live transition for a committed swipe bound to a desktop action,
-    /// saying whether it begins at once; `None` (nothing opened) for anything
-    /// else. `opposite` is the action bound to the reverse swipe. It opens at
-    /// zero: the commit's own travel follows as the hold's first motion.
+    /// Open a live transition for a committed swipe bound to an action with
+    /// a native swipe (see [`live_target`]), saying whether it begins at
+    /// once; `None` (nothing opened) for anything else. `opposite` is the
+    /// action bound to the reverse swipe. It opens at rest: the commit's own
+    /// travel follows as the hold's first motion.
     pub(super) fn begin(
         &mut self,
         session: &HidppSessionId,
@@ -336,29 +397,38 @@ impl SpaceSwipes {
     ) -> Option<Opened> {
         // Live transitions are off without a travel per desktop.
         self.travel?;
-        let source = horizontal_sign(direction)?;
-        let target = desktop_sign(action)?;
-        let swings_both_ways = opposite.and_then(desktop_sign) == Some(-target);
-        // Subscribe to Space changes before the first switch can land.
-        let _ = (self.probe.changes)();
-        let stage = match self
-            .landing
-            .take()
-            .filter(|landing| !landing.is_over(self.probe, at.now))
-        {
-            Some(landing) => Stage::WaitingFirst {
-                landing,
-                action: action.clone(),
-            },
-            None => Stage::InFlight {
+        let (along, source) = swipe_source(direction)?;
+        let (axis, target) = live_target(action)?;
+        let swings_both_ways = opposite.and_then(live_target) == Some((axis, -target));
+        let stage = if switches_desktop(axis) {
+            // Subscribe to Space changes before the first switch can land.
+            let _ = (self.probe.changes)();
+            match self
+                .landing
+                .take()
+                .filter(|landing| !landing.is_over(self.probe, at.now))
+            {
+                Some(landing) => Stage::WaitingFirst {
+                    landing,
+                    action: action.clone(),
+                },
+                None => Stage::InFlight {
+                    progress: 0.0,
+                    bounds: Bounds::read(self.probe),
+                },
+            }
+        } else {
+            Stage::InFlight {
                 progress: 0.0,
-                bounds: Bounds::read(self.probe),
-            },
+                bounds: Bounds::OPEN,
+            }
         };
         let waits = matches!(stage, Stage::WaitingFirst { .. });
         self.active.insert(
             (session.clone(), button),
             Transition {
+                axis,
+                along,
                 polarity: target * source,
                 keep_sign: (!swings_both_ways).then_some(target),
                 stage,
@@ -370,7 +440,11 @@ impl SpaceSwipes {
         Some(if waits {
             Opened::AfterLanding
         } else {
-            Opened::Now(Frame::new(0.0, SpaceSwipePhase::Began))
+            Opened::Now(Frame::new(
+                axis,
+                began_progress(axis, target),
+                SpaceSwipePhase::Began,
+            ))
         })
     }
 
@@ -395,7 +469,7 @@ impl SpaceSwipes {
             return Vec::new();
         };
         if let Stage::InFlight { progress, .. } = t.stage {
-            return vec![Frame::new(progress, SpaceSwipePhase::Cancelled)];
+            return vec![Frame::new(t.axis, progress, SpaceSwipePhase::Cancelled)];
         }
         self.landing = t.stage.landing();
         Vec::new()
@@ -407,6 +481,7 @@ impl SpaceSwipes {
         session: &HidppSessionId,
         button: ButtonId,
         dx: i32,
+        dy: i32,
         at: Timing,
     ) -> Vec<Frame> {
         let (Some(travel), probe) = (self.travel, self.probe) else {
@@ -416,7 +491,12 @@ impl SpaceSwipes {
             return Vec::new();
         };
         let commit_travel = std::mem::replace(&mut t.fresh, false);
-        let delta = t.polarity * f64::from(dx) / travel;
+        let raw = match t.along {
+            SwipeAxis::Horizontal => dx,
+            SwipeAxis::Vertical => dy,
+        };
+        let axis = t.axis;
+        let delta = t.polarity * f64::from(raw) / travel;
         let elapsed = at.arrived.saturating_duration_since(t.moved_at);
         if elapsed >= STALE_MOTION {
             t.velocity = 0.0;
@@ -446,19 +526,31 @@ impl SpaceSwipes {
                 // other (a full desktop's worth finishes at once, with no
                 // speed sample yet).
                 t.velocity = 0.0;
-                let (stage, frame) =
-                    step(hold_sign(delta), 0.0, Bounds::read(probe), probe, at.now);
+                let (stage, frame) = step(
+                    axis,
+                    hold_sign(delta),
+                    0.0,
+                    Bounds::read(probe),
+                    probe,
+                    at.now,
+                );
                 t.stage = stage;
                 match frame.phase {
                     SpaceSwipePhase::Ended { .. } => {
-                        vec![Frame::new(0.0, SpaceSwipePhase::Began), frame]
+                        vec![Frame::new(axis, 0.0, SpaceSwipePhase::Began), frame]
                     }
-                    _ => vec![Frame::new(frame.progress, SpaceSwipePhase::Began)],
+                    _ => vec![Frame::new(axis, frame.progress, SpaceSwipePhase::Began)],
                 }
             }
             &Stage::InFlight { progress, bounds } => {
-                let (stage, frame) =
-                    step(hold_sign(progress + delta), velocity, bounds, probe, at.now);
+                let (stage, frame) = step(
+                    axis,
+                    hold_sign(progress + delta),
+                    velocity,
+                    bounds,
+                    probe,
+                    at.now,
+                );
                 t.stage = stage;
                 vec![frame]
             }
@@ -492,10 +584,17 @@ impl SpaceSwipes {
         let past_halfway = progress.abs() >= COMPLETE_AT && speed > -FLICK_SPEED;
         let flicked = progress.abs() >= FLICK_MIN && speed >= FLICK_SPEED;
         if bounds.allows(sign) && (past_halfway || flicked) {
-            self.landing = Some(Landing::at(self.probe, at.now));
-            vec![Frame::new(progress, SpaceSwipePhase::Ended { speed })]
+            // Gating the next swipe on an overview's landing would just stall.
+            if switches_desktop(t.axis) {
+                self.landing = Some(Landing::at(self.probe, at.now));
+            }
+            vec![Frame::new(
+                t.axis,
+                progress,
+                SpaceSwipePhase::Ended { speed },
+            )]
         } else {
-            vec![Frame::new(progress, SpaceSwipePhase::Cancelled)]
+            vec![Frame::new(t.axis, progress, SpaceSwipePhase::Cancelled)]
         }
     }
 
@@ -508,7 +607,7 @@ impl SpaceSwipes {
                 return true;
             }
             if let Stage::InFlight { progress, .. } = t.stage {
-                frames.push(Frame::new(progress, SpaceSwipePhase::Cancelled));
+                frames.push(Frame::new(t.axis, progress, SpaceSwipePhase::Cancelled));
             } else {
                 landing = t.stage.landing();
             }

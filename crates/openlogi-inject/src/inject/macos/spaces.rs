@@ -36,7 +36,7 @@ use objc2_foundation::{
 use super::super::space_switch::{
     self, Backend, Direction, Failure, Lease, Pace, PostGate, SlideFrame, SlidePhase, SpaceState,
 };
-use super::super::{DesktopSwitch, SpacePosition, SpaceSwipePhase};
+use super::super::{DesktopSwitch, SpacePosition, SpaceSwipePhase, SwipeAxis};
 use super::{app_services, app_services_symbol};
 
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -467,7 +467,12 @@ fn slide_events(direction: Direction) -> Option<Vec<(Duration, CFRetained<CGEven
         DockSwipeLayout::HidEvent => hid_slide_events(&frames, natural_scrolling()),
         DockSwipeLayout::Fields => frames
             .into_iter()
-            .map(|frame| Some((frame.at, slide_event(frame, EMPHATIC_EXIT)?)))
+            .map(|frame| {
+                Some((
+                    frame.at,
+                    slide_event(frame, EMPHATIC_EXIT, SwipeAxis::Horizontal)?,
+                ))
+            })
             .collect(),
     }
 }
@@ -492,17 +497,34 @@ const EMPHATIC_EXIT: f64 = 9999.0;
 /// frame; from about 30 it covers the rest in a frame or two.
 const MAX_LIVE_EXIT: f64 = 10.0;
 
-/// One frame of a slide, in the fields a trackpad's three-finger swipe
+/// The Dock swipe motion a trackpad's three-finger swipe along `axis`
+/// reports, in both event layouts. Mac Mouse Fix's `TouchSimulator` names
+/// them: 1 horizontal, 2 vertical (3 is a pinch).
+const fn dock_motion(axis: SwipeAxis) -> u32 {
+    match axis {
+        SwipeAxis::Horizontal => 1,
+        SwipeAxis::Vertical => 2,
+    }
+}
+
+/// One frame of a three-finger swipe along `axis`, in the fields a trackpad
 /// fills. The layout follows Mac Mouse Fix's `TouchSimulator`, as proposed in
 /// #1672. An Ended frame carries `exit`, an exit velocity toward the
 /// progress sign in Dock progress per second.
-fn slide_event(frame: SlideFrame, exit: f64) -> Option<CFRetained<CGEvent>> {
+fn slide_event(frame: SlideFrame, exit: f64, axis: SwipeAxis) -> Option<CFRetained<CGEvent>> {
     let event = CGEvent::new(None)?;
     CGEvent::set_type(Some(&event), CGEventType(30));
     let phase = i64::from(slide_phase(frame.phase));
-    // Dock swipe subtype, horizontal motion, and the phase in both slots the
+    let motion = dock_motion(axis);
+    // Dock swipe subtype, the swipe's motion, and the phase in both slots the
     // trackpad path fills.
-    for (field, value) in [(110, 23), (123, 1), (165, 1), (132, phase), (134, phase)] {
+    for (field, value) in [
+        (110, 23),
+        (123, i64::from(motion)),
+        (165, 1),
+        (132, phase),
+        (134, phase),
+    ] {
         CGEvent::set_integer_value_field(Some(&event), CGEventField(field), value);
     }
     CGEvent::set_double_value_field(Some(&event), CGEventField(41), 33_231.0);
@@ -513,9 +535,10 @@ fn slide_event(frame: SlideFrame, exit: f64) -> Option<CFRetained<CGEvent>> {
         CGEventField(135),
         i64::from(slide_progress_bits(frame.progress)),
     );
-    let horizontal = f64::from(f32::from_bits(1));
-    CGEvent::set_double_value_field(Some(&event), CGEventField(119), horizontal);
-    CGEvent::set_double_value_field(Some(&event), CGEventField(139), horizontal);
+    // The motion again, as the denormal f32 whose bits are its code.
+    let motion = f64::from(f32::from_bits(motion));
+    CGEvent::set_double_value_field(Some(&event), CGEventField(119), motion);
+    CGEvent::set_double_value_field(Some(&event), CGEventField(139), motion);
     CGEvent::set_integer_value_field(Some(&event), CGEventField(136), 1);
     if frame.phase == SlidePhase::Ended {
         // The Dock finishes an Ended toward its progress sign at any exit
@@ -553,12 +576,12 @@ fn slide_progress_bits(progress: f64) -> u32 {
 
 const HID_TYPE_VELOCITY: u32 = 9;
 const HID_TYPE_DOCK_SWIPE: u32 = 23;
+const HID_FIELD_MASK: u32 = HID_TYPE_DOCK_SWIPE << 16;
 const HID_FIELD_MOTION: u32 = HID_TYPE_DOCK_SWIPE << 16 | 1;
 const HID_FIELD_PROGRESS: u32 = HID_TYPE_DOCK_SWIPE << 16 | 2;
 const HID_FIELD_FLAVOR: u32 = HID_TYPE_DOCK_SWIPE << 16 | 5;
 const HID_FIELD_VELOCITY_X: u32 = HID_TYPE_VELOCITY << 16;
 const HID_FIELD_VELOCITY_Y: u32 = HID_TYPE_VELOCITY << 16 | 1;
-const HID_MOTION_HORIZONTAL: isize = 1;
 const HID_FLAVOR_DOCK_PRIMARY: isize = 3;
 const HID_OPTION_PHASE_SHIFT: u32 = 24;
 
@@ -595,6 +618,8 @@ struct HidSwipe {
     /// default): with it off, Next/Previous are inverted (#1703, reported
     /// against two displays and 13/13 swipes on macOS 27.0.1).
     flip: f64,
+    /// The axis the swipe travels along.
+    axis: SwipeAxis,
 }
 
 impl HidSwipe {
@@ -608,13 +633,25 @@ impl HidSwipe {
             class,
             attach,
             flip,
+            axis: SwipeAxis::Horizontal,
         })
+    }
+
+    /// The same swipe along `axis` instead of sideways.
+    const fn along(mut self, axis: SwipeAxis) -> Self {
+        self.axis = axis;
+        // A trackpad's swipe up reports positive progress with natural
+        // scrolling on: the opposite of the sideways flip.
+        if matches!(axis, SwipeAxis::Vertical) {
+            self.flip = -self.flip;
+        }
+        self
     }
 
     /// A swipe event at `progress`, signed the way the private fields sign it,
     /// with `exit` as the end phase's exit velocity (see [`slide_event`]).
     fn event(&self, phase: u32, progress: f64, exit: f64) -> Option<CFRetained<CGEvent>> {
-        let hid = dock_swipe_hid_event(self.class, phase, self.flip * progress, exit)?;
+        let hid = dock_swipe_hid_event(self.class, phase, self.axis, self.flip * progress, exit)?;
         let event = CGEvent::new(None)?;
         CGEvent::set_type(Some(&event), CGEventType(30));
         // SAFETY: both objects are live; SkyLight retains the HID event.
@@ -662,20 +699,27 @@ fn hid_slide_events(
 fn dock_swipe_hid_event(
     class: &AnyClass,
     phase: u32,
+    axis: SwipeAxis,
     progress: f64,
     exit: f64,
 ) -> Option<Retained<AnyObject>> {
     let hid = hid_event(class, HID_TYPE_DOCK_SWIPE)?;
+    let motion = isize::try_from(dock_motion(axis)).ok()?;
     // SAFETY: private `HIDEvent` setters taking (u32), (NSInteger, u32),
     // (double, u32) and (HIDEvent) respectively.
     unsafe {
         let _: () = msg_send![&*hid, setOptions: phase << HID_OPTION_PHASE_SHIFT];
-        let _: () =
-            msg_send![&*hid, setIntegerValue: HID_MOTION_HORIZONTAL, forField: HID_FIELD_MOTION];
+        let _: () = msg_send![&*hid, setIntegerValue: motion, forField: HID_FIELD_MOTION];
         let _: () =
             msg_send![&*hid, setIntegerValue: HID_FLAVOR_DOCK_PRIMARY, forField: HID_FIELD_FLAVOR];
         let _: () = msg_send![&*hid, setDoubleValue: progress, forField: HID_FIELD_PROGRESS];
-        if phase == 4 {
+        // A trackpad names the swipe's direction on its moving frames; the
+        // Dock ignores a vertical swipe without it.
+        if phase == slide_phase(SlidePhase::Changed) && progress != 0.0 {
+            let mask = swipe_mask(axis, progress);
+            let _: () = msg_send![&*hid, setIntegerValue: mask, forField: HID_FIELD_MASK];
+        }
+        if phase == slide_phase(SlidePhase::Ended) {
             let velocity = hid_event(class, HID_TYPE_VELOCITY)?;
             let speed = progress.signum() * exit;
             let _: () =
@@ -688,6 +732,17 @@ fn dock_swipe_hid_event(
     Some(hid)
 }
 
+/// The direction mask a trackpad's Dock swipe carries, as recorded on
+/// macOS 27: vertical 1 (progress up) / 2, horizontal 8 (progress up) / 4.
+const fn swipe_mask(axis: SwipeAxis, progress: f64) -> isize {
+    match (axis, progress > 0.0) {
+        (SwipeAxis::Vertical, true) => 1,
+        (SwipeAxis::Vertical, false) => 2,
+        (SwipeAxis::Horizontal, true) => 8,
+        (SwipeAxis::Horizontal, false) => 4,
+    }
+}
+
 /// Post one frame of a live Space transition; see
 /// [`crate::post_space_swipe`].
 /// The one-shot switch's lease, held by a live transition from its Began
@@ -697,7 +752,11 @@ fn dock_swipe_hid_event(
 /// hold's Dock gesture.
 static LIVE_LEASE: Mutex<Option<Lease<'static>>> = Mutex::new(None);
 
-pub(in crate::inject) fn post_space_swipe(progress: f64, phase: SpaceSwipePhase) -> bool {
+pub(in crate::inject) fn post_space_swipe(
+    axis: SwipeAxis,
+    progress: f64,
+    phase: SpaceSwipePhase,
+) -> bool {
     let mut lease = LIVE_LEASE.lock().unwrap_or_else(PoisonError::into_inner);
     match phase {
         SpaceSwipePhase::Began => {
@@ -720,7 +779,7 @@ pub(in crate::inject) fn post_space_swipe(progress: f64, phase: SpaceSwipePhase)
         }
         _ => {}
     }
-    let posted = if let Some(event) = live_swipe_event(progress, phase) {
+    let posted = if let Some(event) = live_swipe_event(axis, progress, phase) {
         CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&event));
         true
     } else {
@@ -744,22 +803,39 @@ pub(in crate::inject) fn post_space_swipe(progress: f64, phase: SpaceSwipePhase)
     posted
 }
 
+/// A live swipe's progress along `axis` (see [`SwipeAxis`]) as the progress
+/// a Dock swipe frame carries.
+fn live_dock_progress(axis: SwipeAxis, progress: f64) -> f64 {
+    match axis {
+        SwipeAxis::Horizontal => dock_progress(progress),
+        // Mission Control (or App Exposé) is fully open at 1.0, as a
+        // trackpad's swipe up reports it.
+        SwipeAxis::Vertical => progress,
+    }
+}
+
 /// One live-swipe frame in the Dock swipe layout this macOS reads: the same
-/// frame a slide posts, at the hand's progress rather than a scheduled one.
-/// An Ended exits at the hand's speed, so the Dock eases on from where the
-/// hand let go instead of jumping the rest of the way.
-fn live_swipe_event(progress: f64, phase: SpaceSwipePhase) -> Option<CFRetained<CGEvent>> {
+/// frame a slide posts, along `axis` and at the hand's progress rather than
+/// a scheduled one. An Ended exits at the hand's speed, so the Dock eases on
+/// from where the hand let go instead of jumping the rest of the way.
+fn live_swipe_event(
+    axis: SwipeAxis,
+    progress: f64,
+    phase: SpaceSwipePhase,
+) -> Option<CFRetained<CGEvent>> {
     let (phase, exit) = match phase {
         SpaceSwipePhase::Began => (SlidePhase::Began, 0.0),
         SpaceSwipePhase::Changed => (SlidePhase::Changed, 0.0),
-        SpaceSwipePhase::Ended { speed } => (SlidePhase::Ended, live_exit(speed)),
+        SpaceSwipePhase::Ended { speed } => (SlidePhase::Ended, live_exit(axis, speed)),
         SpaceSwipePhase::Cancelled => (SlidePhase::Cancelled, 0.0),
     };
-    let progress = dock_progress(progress);
+    let progress = live_dock_progress(axis, progress);
     match *DOCK_SWIPE_LAYOUT {
-        DockSwipeLayout::HidEvent => {
-            HidSwipe::new(natural_scrolling())?.event(slide_phase(phase), progress, exit)
-        }
+        DockSwipeLayout::HidEvent => HidSwipe::new(natural_scrolling())?.along(axis).event(
+            slide_phase(phase),
+            progress,
+            exit,
+        ),
         DockSwipeLayout::Fields => slide_event(
             SlideFrame {
                 phase,
@@ -767,15 +843,16 @@ fn live_swipe_event(progress: f64, phase: SpaceSwipePhase) -> Option<CFRetained<
                 at: Duration::ZERO,
             },
             exit,
+            axis,
         ),
     }
 }
 
-/// The Dock exit velocity for a hand released at `speed` desktop widths per
-/// second toward the switch: the same motion in Dock progress, at rest when
-/// the hand was, and capped at [`MAX_LIVE_EXIT`].
-fn live_exit(speed: f64) -> f64 {
-    dock_progress(speed).clamp(0.0, MAX_LIVE_EXIT)
+/// The Dock exit velocity for a hand released at `speed` (progress along
+/// `axis` per second) toward the finish: the same motion in Dock progress,
+/// at rest when the hand was, and capped at [`MAX_LIVE_EXIT`].
+fn live_exit(axis: SwipeAxis, speed: f64) -> f64 {
+    live_dock_progress(axis, speed).clamp(0.0, MAX_LIVE_EXIT)
 }
 
 type Dictionary = CFDictionary<CFString, CFType>;
